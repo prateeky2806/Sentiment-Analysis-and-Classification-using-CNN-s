@@ -1,0 +1,81 @@
+require 'nn'
+require 'sys'
+require 'torch'
+
+local Train = torch.class('Train')
+
+-- Perform one epoch of training.
+function Train:trainIt(trainData, trainLabels, model, criterion, optimMethod, layers, state, params, grads)
+  model:training()
+
+  local trainSize = trainData:size(1)
+  local totalErr = 0
+
+  local classes = {}
+  for i = 1, opt.numClasses do
+    table.insert(classes, i)
+  end
+  local confusion = optim.ConfusionMatrix(classes)
+  confusion:zero()
+
+  local config -- for optim
+  --if opt.optimMethod == 'adadelta' then
+    config = { rho = 0.95, eps = 1e-6 } 
+  --end
+
+  -- shuffle batches
+  local numBatches = math.floor(trainSize / opt.batchSize)
+  local shuffle = torch.randperm(numBatches)
+  for i = 1, shuffle:size(1) do
+    local t = (shuffle[i] - 1) * opt.batchSize + 1
+    local batchSize = math.min(opt.batchSize, trainSize - t + 1)
+
+    -- data samples and labels, in mini batches.
+    local inputs = trainData:narrow(1, t, batchSize)
+    local targets = trainLabels:narrow(1, t, batchSize)
+    if opt.cudnn == 1 then
+      inputs = inputs:cuda()
+      targets = targets:cuda()
+    else
+      inputs = inputs:double()
+      targets = targets:double()
+    end
+
+    -- closure to return err, df/dx
+    local func = function(x)
+      -- get new parameters
+      if x ~= params then
+        params:copy(x)
+      end
+      -- reset gradients
+      grads:zero()
+
+      -- forward pass
+      local outputs = model:forward(inputs)
+      local err = criterion:forward(outputs, targets)
+
+      -- track errors and confusion
+      totalErr = totalErr + err * batchSize
+      for j = 1, batchSize do
+        confusion:add(outputs[j], targets[j])
+      end
+
+      -- compute gradients
+      local df_do = criterion:backward(outputs, targets)
+      model:backward(inputs, df_do)
+
+      if opt.modelType == 'static' then
+        -- don't update embeddings for static model
+        layers.w2v.gradWeight:zero()
+      end
+
+      return err, grads
+    end
+    optimMethod(func, params, config, state)
+    -- reset padding embedding to zero
+    layers.w2v.weight[1]:zero()
+  end
+  confusion:updateValids()
+  return confusion.totalValid
+end
+return Train

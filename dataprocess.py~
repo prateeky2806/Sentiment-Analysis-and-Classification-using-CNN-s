@@ -1,0 +1,228 @@
+import numpy as np
+import h5py
+import re
+import sys
+import operator
+import argparse
+
+FILE_PATHS = {"SST1": ("datasets/sst1.train",
+                  "datasets/sst.dev",
+                  "datasets/sst1.test"),
+              "SST2": ("datasets/sst2.train",
+                  "datasets/sst2.dev",
+                  "datasets/sst2.test"),
+              "MR": ("datasets/mr.all", "", ""),
+              "SUBJ": ("datasets/subj.all", "", ""),
+              "CR": ("datasets/cr.all", "", ""),
+              "MPQA": ("datasets/mpqa.all", "", ""),
+              "TREC": ("datasets/TREC.train.all", "", "datasets/TREC.test.all"),
+              }
+
+args = {}
+
+def main():
+  global args
+  parser = argparse.ArgumentParser(
+      description =__doc__,
+      formatter_class=argparse.RawDescriptionHelpFormatter)
+  parser.add_argument('dataset', help="Name of the Data set", type=str)
+  parser.add_argument('w2v', help="word2vec.bin file to get the vectors from", type=str)
+  parser.add_argument('--padding', help="padding around each sentence", type=int, default=4)
+  args = parser.parse_args()
+  dataset = args.dataset
+  
+  trainPath, devPath, testPath = FILE_PATHS[dataset]
+
+  # Loading data: This will give us a word to index mapping. and split the data into train, test and dev sets and their corresponding labels if we don't have all these sets already.
+  wordToIdx, train, trainLabel, test, testLabel, dev, devLabel = loadData(dataset, trainPath, testName=testPath, devName=devPath, padding=args.padding)
+
+  # Creating word mapping to text file. This file will contain the all the words of the vocabulary with a specific index provided to each  of them. This file containing indicies will be used to create a map between word and vectors using word2vec.bin which is a pre-computed set of words and their corresponding vectors.
+
+  with open(dataset + 'Mapping.txt', 'w+') as embeddings_f:		# Creating Word Mapping text file	
+    embeddings_f.write("*PADDING* 1\n")						# Index 1 is given to padding always
+    for word, idx in sorted(wordToIdx.items(), key=operator.itemgetter(1)):   # Sort word alphabetically and Iteratively provide index.
+      embeddings_f.write("%s %d\n" % (word, idx))				# Writing words and index in text file
+
+  # Load word2vec: Takes input word2vec.bin file and wordToIndex map
+  w2v = loadBinVec(args.w2v, wordToIdx)					# Returns a numpy array containing wordVectors
+  V = len(wordToIdx) + 1							# Vocabulary size +1 beacuse of padding index
+  print 'Vocab size:', V							# prints vocabulary size.
+
+
+  # Not all words in wordToIdx are in w2v.
+  # Word embeddings initialized to random Unif(-0.25, 0.25)
+  embed = np.random.uniform(-0.25, 0.25, (V, len(w2v.values()[0])))		# Initialise a np array of vocabulary*300 with random
+										# entries
+  embed[0] = 0
+  for word, vec in w2v.items():							# w2v.item returns word from vocab and thier respective 										# vectors from google word2vec predefined vectors
+    embed[wordToIdx[word] - 1] = vec						# embed contains all wprd vectors.
+
+  # Shuffle train
+  print 'train size:', train.shape
+  N = train.shape[0]
+  perm = np.random.permutation(N)						# Randomly shuffle the data and the train.
+  train = train[perm]
+  trainLabel = trainLabel[perm]
+
+  # Store the training, test data and word vectors in hdf5 format
+  filename = dataset + '.hdf5'
+  with h5py.File(filename, "w") as f:
+    f["w2v"] = np.array(embed)
+    f['train'] = train
+    f['trainLabel'] = trainLabel
+    f['test'] = test
+    f['testLabel'] = testLabel
+    f['dev'] = dev
+    f['devLabel'] = devLabel
+
+def loadBinVec(fname, vocab):
+    """
+    Loads 300x1 word vecs from Google (Mikolov) word2vec
+    """
+    wordVecs = {}
+    with open(fname, "rb") as f:
+        header = f.readline()
+        vocabSize, layer1Size = map(int, header.split())
+        binaryLen = np.dtype('float32').itemsize * layer1Size
+        for line in xrange(vocabSize):
+            word = []
+            while True:
+                ch = f.read(1)
+                if ch == ' ':
+                    word = ''.join(word)
+                    break
+                if ch != '\n':
+                    word.append(ch)   
+            if word in vocab:
+               wordVecs[word] = np.fromstring(f.read(binaryLen), dtype='float32')  
+            else:
+                f.read(binaryLen)
+    return wordVecs
+
+
+# This function creates all the data sets(train,test,dev) and an index of words.
+def loadData(dataset, trainName, testName='', devName='', padding=4):
+
+  # append all the files train, test, dev for processing later.
+  fileNames = [trainName]
+  if not testName == '': fileNames.append(testName)
+  if not devName == '': fileNames.append(devName)
+
+  # Input all the file names and datasets.
+  # Output returns maximum length of sentence and wordToIndex
+  maxSentLen, wordToIdx = getVocab(fileNames, dataset)
+
+  dev = []
+  devLabel = []
+  train = []
+  trainLabel = []
+  test = []
+  testLabel = []
+
+  files = []
+  data = []
+  dataLabel = []
+
+  # appending data and labels in their respective arrays
+  fTrain = open(trainName, 'r')
+  files.append(fTrain)
+  data.append(train)
+  dataLabel.append(trainLabel)
+  if not testName == '':
+    fTest = open(testName, 'r')
+    files.append(fTest)
+    data.append(test)
+    dataLabel.append(testLabel)
+  if not devName == '':
+    fDev = open(devName, 'r')
+    files.append(fDev)
+    data.append(dev)
+    dataLabel.append(devLabel)
+
+  # Padding code idea copied from stackoverflow
+  for d, lbl, f in zip(data, dataLabel, files):
+    for line in f:
+      words = lineToWords(line, dataset)				# Convert line to words
+      y = int(line[0]) + 1
+      sent = [wordToIdx[word] for word in words]			# iterating over each word in sentence
+      # Start padding
+      if len(sent) < maxSentLen + padding:
+          sent.extend([1] * (maxSentLen + padding - len(sent)))
+      # End padding
+      sent = [1]*padding + sent						# Padded sentence is generated
+
+      d.append(sent)							# Appended to data
+      lbl.append(y)
+
+  fTrain.close()
+  if not testName == '':
+    fTest.close()
+  if not devName == '':
+    fDev.close()
+
+  return wordToIdx, np.array(train, dtype=np.int32), np.array(trainLabel, dtype=np.int32), np.array(test, dtype=np.int32), np.array(testLabel, dtype=np.int32), np.array(dev, dtype=np.int32), np.array(devLabel, dtype=np.int32)
+
+
+
+# returns maximum sentence length and word to index
+def getVocab(fileList, dataset=''):
+  maxSentLen = 0
+  wordToIdx = {}
+  # Starts at 2 for padding
+  idx = 2
+
+  for filename in fileList:
+    f = open(filename, "r")
+    for line in f:
+        words = lineToWords(line, dataset)
+        maxSentLen = max(maxSentLen, len(words))
+        for word in words:
+            if not word in wordToIdx:
+                wordToIdx[word] = idx
+                idx += 1
+
+    f.close()
+
+  return maxSentLen, wordToIdx
+
+# Convert line to word
+def lineToWords(line, dataset):
+  if dataset == 'SST1' or dataset == 'SST2':
+    cleanLine = cleanStrSst(line.strip())
+  else:
+    cleanLine = cleanStr(line.strip())
+  words = cleanLine.split(' ')
+  words = words[1:]
+
+  return words
+
+#  
+def cleanStr(string):
+  
+  string = re.sub(r"[^A-Za-z0-9(),!?\'\`]", " ", string)     
+  string = re.sub(r"\'s", " \'s", string) 
+  string = re.sub(r"\'ve", " \'ve", string) 
+  string = re.sub(r"n\'t", " n\'t", string) 
+  string = re.sub(r"\'re", " \'re", string) 
+  string = re.sub(r"\'d", " \'d", string) 
+  string = re.sub(r"\'ll", " \'ll", string) 
+  string = re.sub(r",", " , ", string) 
+  string = re.sub(r"!", " ! ", string) 
+  string = re.sub(r"\(", " ( ", string) 
+  string = re.sub(r"\)", " ) ", string) 
+  string = re.sub(r"\?", " ? ", string) 
+  string = re.sub(r"\s{2,}", " ", string)    
+  return string.strip().lower()
+
+def cleanStrSst(string):
+  """
+  Tokenization/string cleaning for the SST dataset
+  """
+  string = re.sub(r"[^A-Za-z0-9(),!?\'\`]", " ", string)   
+  string = re.sub(r"\s{2,}", " ", string)    
+  return string.strip().lower()
+
+if __name__ == '__main__':
+  main()
+
+

@@ -1,0 +1,5 @@
+ssh tushar@10.16.11.92
+enter password: kazooie
+cd ~/Videos/prateek
+
+scp -r folder/ tushar@10.16.11.92:~/Videos/prateek
